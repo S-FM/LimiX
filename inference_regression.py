@@ -25,6 +25,11 @@ from utils.utils import  download_datset, download_model
 if not torch.cuda.is_available():
     raise SystemError('GPU device not found. For fast training, please enable GPU.')
 
+def get_rank():
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank()
+    else:
+        return 0
 
 def inference_dataset(X_train, X_test, y_train, y_test, model):
     """
@@ -141,22 +146,30 @@ if __name__ == '__main__':
                     else:
                         model.set_inference_config(inference_config, 0.9, 0)
                 try:
+                    t1 = time.time()
+                    t2 = t1
                     rmse_result, r2_result, pred_result = inference_dataset(X_train.copy(), X_test.copy(), y_train.copy(), y_test.copy(), model)
+                    t2 = time.time()
                 except Exception as e:
-                    print(f"Error processing {dataset_name} with sample_index {sample_index}: {e}, config: {model.inference_config}")
-                    sample_index += 1
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    continue
+                    if args.debug:
+                        raise
+                    else:
+                        msg = str(e)
+                        print(f"Error processing {dataset_name} with sample_index {sample_index}: {msg[:200]}")
+                        sample_index += 1
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        continue
                 if sample_index == 0:
                     rmse_results['dafault_rmse'] = rmse_result['rmse']
                     r2_results['dafault_r2'] = r2_result['R2']
                 rmse_results['sample_rmse'].append(rmse_result['rmse'])
+                rmse_results['time'] = (t2-t1)*1000
                 r2_results['sample_r2'].append(r2_result['R2'])
 
                 if args.debug and search_space_sample_num <= 0:
                     print(f"[{idx}] {dataset_name} -> {rmse_result}, {r2_result}")
-                if not (int(os.environ.get('WORLD_SIZE', -1)) > 0 and dist.get_rank() != 0):
+                if not (int(os.environ.get('WORLD_SIZE', -1)) > 0 and get_rank() != 0):
                     rst.update(**rmse_result)
                     rst.update(**r2_result)
                     rst['search_space_sample_index'] = sample_index
@@ -166,8 +179,11 @@ if __name__ == '__main__':
                 sample_index += 1
 
         except Exception as e:
-            # raise e
-            print(f"Error processing {dataset_name}: {e}")
+            if args.debug:
+                raise
+            else:
+                msg = str(e)
+                print(f"Error processing {dataset_name}: {msg[:200]}")
         if args.debug and search_space_sample_num > 0:
             print(f"[{idx}] {dataset_name} -> rmse default: {rmse_results['dafault_rmse']:.6f} "
                     f"min: {min(rmse_results['sample_rmse']):.6f}, "
@@ -178,7 +194,7 @@ if __name__ == '__main__':
                     f"min: {min(r2_results['sample_r2']):.6f}, "
                     f"mean: {np.mean(r2_results['sample_r2']):.6f}")
             
-    if not (int(os.environ.get('WORLD_SIZE', -1)) > 0 and dist.get_rank() != 0):
+    if not (int(os.environ.get('WORLD_SIZE', -1)) > 0 and get_rank() != 0):
         rstsdf = pd.DataFrame(rsts)
         rstsdf.to_csv(os.path.join(save_root, 'all_rst.csv'), index=False)
 

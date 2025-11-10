@@ -4,6 +4,8 @@ from sklearn.datasets import fetch_california_housing
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import r2_score
 from huggingface_hub import hf_hub_download
+import torch
+
 try:
     from sklearn.metrics import root_mean_squared_error as mean_squared_error
 except:
@@ -31,7 +33,7 @@ y_train_normalized = (y_train - y_mean) / y_std
 y_test_normalized = (y_test - y_mean) / y_std
 
 model_path = hf_hub_download(repo_id="stableai-org/LimiX-16M", filename="LimiX-16M.ckpt", local_dir="./cache")
-model = LimiXPredictor(device='cuda', model_path=model_path, inference_config='config/reg_default_retrieval.json')
+model = LimiXPredictor(device=torch.device('cuda'), model_path=model_path, inference_config='config/reg_default_retrieval.json')
 y_pred = model.predict(X_train, y_train_normalized, X_test, task_type="Regression")    
 
 # Compute RMSE and R²

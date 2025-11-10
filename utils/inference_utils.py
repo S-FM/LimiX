@@ -10,37 +10,6 @@ from sklearn.metrics import roc_auc_score, accuracy_score, f1_score, log_loss
 from torch.utils.data import DistributedSampler
 
 
-def shuffle_data_along_dim(X: torch.Tensor | np.ndarray, dim: int = 0) -> torch.Tensor | np.ndarray:
-    """
-        Shuffles data (torch.Tensor or np.ndarray) along a specified axis.
-
-        Args:
-            X (torch.Tensor | np.ndarray): The input multidimensional tensor or array.
-            dim (int): The dimension along which to shuffle elements.
-
-        Returns:
-            X_(torch.Tensor | np.ndarray): A new tensor or array with elements shuffled along the specified dimension.
-        """
-    if isinstance(X, np.ndarray):
-        shuffled_indices = np.random.permutation(X.shape[dim])
-        reshaped_indices = shuffled_indices.reshape(
-            tuple(1 if i != dim else -1 for i in range(X.ndim))
-        )
-        shuffled_array = np.take_along_axis(X, reshaped_indices, axis=dim)
-        return shuffled_array
-    elif isinstance(X, torch.Tensor):
-        dim_size = X.size(dim)
-        shuffled_indices = torch.randperm(dim_size, device=X.device)
-        index_shape = [1] * X.dim()
-        index_shape[dim] = dim_size
-        expanded_indices = shuffled_indices.view(index_shape)
-        broadcasted_indices = expanded_indices.expand_as(X)
-        shuffled_tensor = torch.gather(X, dim, broadcasted_indices)
-        return shuffled_tensor
-    else:
-        raise TypeError("Data must be a torch.Tensor or np.ndarray")
-
-
 def auc_metric(target, pred, multi_class='ovo', numpy=False):
     lib = np if numpy else torch
     try:

@@ -3,16 +3,21 @@ import functools
 
 import torch
 import torch.nn as nn
+from torch.cuda import OutOfMemoryError
 from torch.utils.checkpoint import checkpoint
+from functools import partial
+from torch.amp import autocast
+
+
+
 
 try:
     from flash_attn.flash_attn_interface import flash_attn_varlen_kvpacked_func, flash_attn_varlen_qkvpacked_func
-
+    from flash_attn import flash_attn_func
     HAVE_FLASH_ATTN = True
 except (ModuleNotFoundError, ImportError):
     HAVE_FLASH_ATTN = False
 
-from functools import partial
 from typing_extensions import override
 
 Activation = Literal['gelu']
@@ -29,7 +34,7 @@ class LayerNormMixedPrecision(nn.LayerNorm):
     """
     def forward(self, input: torch.Tensor):
         if input.dtype == torch.float16 and sum(self.normalized_shape) < 512:
-            with torch.amp.autocast("cuda" if input.is_cuda else "cpu", enabled=False):
+            with autocast(device_type="cuda" if input.is_cuda else "cpu", enabled=False):
                 return super().forward(input)
         else:
             return super().forward(input)
@@ -165,6 +170,123 @@ class MultiheadAttention(torch.nn.Module):
                 )
         return atten_out # type: ignore
     
+    def chunked_flash_attention(
+            self,
+            qkv: torch.Tensor | None,
+            q: torch.Tensor | None,
+            kv: torch.Tensor | None
+    ) -> torch.Tensor:
+        assert HAVE_FLASH_ATTN, "Flash attention is not supported. Please install/reinstall flash attention."
+
+        chunk_size = 1000000000 // 2 // 192 // qkv.shape[1]
+
+        if self.qkv_combined and qkv is not None:
+            B, S = qkv.shape[:2]
+            # Split into chunks along sequence dimension
+            atten_out = torch.empty(B, S, self.num_heads * self.head_dim, device=qkv.device, dtype=qkv.dtype)
+
+            for i in range(0, B, chunk_size):
+                chunk_end = min(i + chunk_size, B)
+                # qkv_chunk = qkv[:, i:chunk_end]
+                qkv_chunk = qkv[i:chunk_end]
+
+                chunk_B, chunk_S = qkv_chunk.shape[:2]
+                chunk_out = flash_attn_varlen_qkvpacked_func(
+                    qkv_chunk.reshape(chunk_B * chunk_S, 3, self.num_heads, self.head_dim),
+                    self.get_cu_seqlens(chunk_B, chunk_S, qkv.device),
+                    chunk_S,
+                    dropout_p=self.dropout,
+                    softmax_scale=None,
+                    causal=False,
+                    return_attn_probs=False,
+                    deterministic=False,
+                )
+                atten_out[i:chunk_end] = chunk_out.reshape(chunk_B, chunk_S, -1)
+
+        elif not self.qkv_combined and q is not None and kv is not None:
+            B, S = q.shape[:2]
+            kv_shape = kv.shape
+            # Split into chunks along sequence dimension for Q
+            atten_out = torch.empty(B, S, self.num_heads * self.head_dim, device=q.device, dtype=q.dtype)
+
+            for i in range(0, B, chunk_size):
+                chunk_end = min(i + chunk_size, B)
+                q_chunk = q[i:chunk_end]
+
+                chunk_B, chunk_S = q_chunk.shape[:2]
+                chunk_out = flash_attn_varlen_kvpacked_func(
+                    q_chunk.reshape(chunk_B * chunk_S, self.num_heads, self.head_dim),
+                    kv.reshape(B * kv_shape[1], 2, self.num_heads, self.head_dim),
+                    self.get_cu_seqlens(chunk_B, chunk_S, q.device),
+                    self.get_cu_seqlens(B, kv_shape[1], kv.device),
+                    chunk_S,
+                    kv_shape[1],
+                    dropout_p=self.dropout,
+                    causal=False,
+                    return_attn_probs=False,
+                    deterministic=False,
+                )
+                atten_out[i:chunk_end] = chunk_out.reshape(chunk_B, chunk_S, -1)
+
+            # Concatenate all query tiles
+        return atten_out.reshape(B * S, self.num_heads, self.head_dim)
+
+    def caculate_attention_score(self, q: torch.Tensor | None, k: torch.Tensor | None) -> torch.Tensor:
+        if len(q.shape) == 3:
+            q = q.unsqueeze(0)
+            k = k.unsqueeze(0)
+        logits = torch.einsum("b q h d, b k h d -> b q k h", q, k)
+        logits *= torch.sqrt(torch.tensor(1.0 / q.shape[-1])).to(k.device)
+        ps = torch.softmax(logits.float(), dim=2).to(torch.float16).mean(dim=-1)
+        del logits
+        return ps
+
+    def chunked_caculate_attention_score(self, q: torch.Tensor | None, k: torch.Tensor | None) -> torch.Tensor:
+        if len(q.shape) == 4:
+            B, S, H, D = q.shape
+        else:
+            S, H, D = q.shape
+        try:
+            if len(q.shape) == 3:
+                chunk_size = max(10000000 // 2 // 192 // q.shape[0], 1)
+                ps = torch.zeros(1, q.shape[0], k.shape[0], device=q.device, dtype=torch.float16)
+                for i in range(0, S, chunk_size):
+                    chunk_end = min(i + chunk_size, q.shape[0])
+                    q_chunk = q[i:chunk_end]
+                    k_chunk = k
+                    ps_chunk = self.caculate_attention_score(q_chunk.to(q.device), k_chunk.to(k.device))
+                    ps[:, i:chunk_end] = ps_chunk.to(q.device)
+            else:
+                chunk_size = max(2000000000 // 2 // 192 // q.shape[1] // k.shape[1], 1)
+                ps = torch.zeros(B, q.shape[1], k.shape[1], device=q.device, dtype=torch.float16)
+                for i in range(0, B, chunk_size):
+                    chunk_end = min(i + chunk_size, B)
+                    q_chunk = q[i:chunk_end]
+                    k_chunk = k[i:chunk_end]
+                    ps_chunk = self.caculate_attention_score(q_chunk.to(q.device), k_chunk.to(k.device))
+                    ps[i:chunk_end] = ps_chunk.to(q.device)
+        except OutOfMemoryError as e:
+            attention_device = torch.device("cpu")
+            if len(q.shape) == 3:
+                chunk_size = max(10000000 // 2 // 192 // q.shape[0], 1)
+                ps = torch.zeros(1, q.shape[0], k.shape[0], device=q.device, dtype=torch.float16)
+                for i in range(0, S, chunk_size):
+                    chunk_end = min(i + chunk_size, q.shape[0])
+                    q_chunk = q[i:chunk_end]
+                    k_chunk = k
+                    ps_chunk = self.caculate_attention_score(q_chunk.to(q.device), k_chunk.to(k.device))
+                    ps[:, i:chunk_end] = ps_chunk.to(attention_device)
+            else:
+                chunk_size = max(2000000000 // 2 // 192 // q.shape[1] // k.shape[1], 1)
+                ps = torch.zeros(B, q.shape[1], k.shape[1], device=attention_device, dtype=torch.float16)
+                for i in range(0, B, chunk_size):
+                    chunk_end = min(i + chunk_size, B)
+                    q_chunk = q[i:chunk_end]
+                    k_chunk = k[i:chunk_end]
+                    ps_chunk = self.caculate_attention_score(q_chunk.to(q.device), k_chunk.to(k.device))
+                    ps[i:chunk_end] = ps_chunk.to(attention_device)
+        return ps.to(torch.float16)
+
     @override
     def forward(self, 
                 x: torch.Tensor, 
@@ -210,12 +332,15 @@ class MultiheadAttention(torch.nn.Module):
                 kv = kv.expand(*expand_shape)
             else:
                 kv = torch.einsum("... s, j h d s -> ... j h d", x_kv, self.kv_proj_weight)
-                
-        if attn_mask is None and HAVE_FLASH_ATTN and self.qkv_proj_weight.device == torch.device("cuda"):
-            atten_out = self.compute_attention_by_flashattn(qkv, q, kv)
-        else:
-            atten_out = self.compute_attention_by_torch(qkv, q, kv, attn_mask)
-                
+
+        try:
+            if attn_mask is None and HAVE_FLASH_ATTN and self.qkv_proj_weight.device.type == "cuda":
+                atten_out = self.compute_attention_by_flashattn(qkv, q, kv)
+            else:
+                atten_out = self.compute_attention_by_torch(qkv, q, kv, attn_mask)
+        except OutOfMemoryError as e:
+            atten_out = self.chunked_flash_attention(qkv, q, kv)
+
         atten_out = atten_out.reshape(BS, F, self.num_heads, self.head_dim)
 
         if qkv is not None:
@@ -223,23 +348,16 @@ class MultiheadAttention(torch.nn.Module):
         else:
             k,v=kv.unbind(dim=2)
         if calculate_feature_attention:
-            logits = torch.einsum("b q h d, b k h d -> b q k h", q, k)
-            logits *= (
-                torch.sqrt(torch.tensor(1.0 / (q.shape[-1]*q.shape[-2]))).to(k.device)
-            )
-            ps = torch.softmax(logits, dim=2).to(torch.float16)
-            del logits
-            feature_attention = torch.mean(ps, dim=-1)
-            del ps
+            try:
+                feature_attention = self.caculate_attention_score(q, k)
+            except (OutOfMemoryError, RuntimeError) as e:
+                feature_attention = self.chunked_caculate_attention_score(q, k)
+
         if calculate_sample_attention:
-            logits = torch.einsum("b q h d, b k h d -> b q k h", q, k)
-            logits *= (
-                torch.sqrt(torch.tensor(1.0 / (q.shape[-1] * q.shape[-2]))).to(k.device)
-            )
-            ps = torch.softmax(logits, dim=2).to(torch.float16)
-            del logits
-            sample_attention = torch.mean(ps, dim=-1)
-            del ps
+            try:
+                sample_attention = self.caculate_attention_score(q[-1], k[-1])
+            except (OutOfMemoryError, RuntimeError) as e:
+                sample_attention = self.chunked_caculate_attention_score(q[-1], k[-1])
         out = torch.einsum(
             "... h d, h d s -> ... s",
             atten_out,
@@ -255,35 +373,51 @@ class EncoderBaseLayer(nn.Module):
                  embed_dim: int, 
                  hid_dim:int, 
                  dropout: float=0,
+                 pre_norm: bool=False,
                  activation: str='gelu',
                  layer_norm_eps: float=1e-5,
                  device: torch.device|None=None,
                  dtype: torch.dtype|None=None,
                  recompute_attn: bool=False,
-                 calculate_sample_attention: bool = False,
-                 calculate_feature_attention: bool = False,
+                 mlp_use_residual:bool=False,
+                 layer_arch: str = 'fmfmsm',
+                 seq_attn_isolated: bool = False,
+                 seq_attn_serial: bool = False,  
+                 self_share_all_kv_heads: bool = False,
+                 cross_share_all_kv_heads: bool = True,
                  ):
         super().__init__()
         self.nhead = nhead
         self.embed_dim = embed_dim
         self.hid_dim = hid_dim
         self.dropout = dropout
+        self.pre_norm = pre_norm
         self.activation = activation
         self.layer_norm_eps = layer_norm_eps
         self.device = device
         self.dtype = dtype
+        self.layer_arch = layer_arch
         self.head_dim = self.embed_dim // self.nhead
         self.recompute_attn = recompute_attn
         
         self.feature_attentions = []
         self.sequence_attentions = []
         self.mlp = []
-        self.items_attn_num = 1             # items attention number
-        self.calculate_sample_attention = calculate_sample_attention
-        self.calculate_feature_attention = calculate_feature_attention
-        self.feature_attn_num = 2
-        self.mlp_num = 3
+        self.feature_attn_num = 1           # feature attention number
+        self.seq_attn_num = 1             # sequence attention number
+        self.mlp_num = 1                    # mlp number
+        if layer_arch == 'fmfmsm':
+            self.feature_attn_num = 2
+            self.mlp_num = 3
         
+        self.self_share_all_kv_heads = self_share_all_kv_heads
+        self.cross_share_all_kv_heads = cross_share_all_kv_heads
+        self.seq_attn_serial = seq_attn_serial
+        self.seq_attn_isolated = seq_attn_isolated
+
+        if self.seq_attn_isolated:
+            self.seq_attn_num *= 2
+
         # attention+MLP
         self.feature_attentions = nn.ModuleList(
                                                     [
@@ -310,7 +444,7 @@ class EncoderBaseLayer(nn.Module):
                                                             dropout=self.dropout,
                                                             recompute=self.recompute_attn,
                                                         ) 
-                                                        for _ in range(self.items_attn_num)
+                                                        for _ in range(self.seq_attn_num)
                                                     ]
                                                 )
         self.mlp = nn.ModuleList(
@@ -329,23 +463,41 @@ class EncoderBaseLayer(nn.Module):
                                     ]
                                  )
         
-        self.layer_steps = [
-                            partial(
-                                self.call_features_attention,
-                                index=0
-                            ),
-                            self.mlp[0],
-                            partial(
-                                self.call_features_attention,
-                                index=1
-                            ),
-                            self.mlp[1],
-                            partial(
-                                self.call_sequence_attention,
-                                index=0
-                            ),
-                            self.mlp[2]
-        ]
+        self.layer_steps = []
+        if self.layer_arch == 'fmfmsm':
+            assert len(self.feature_attentions) >= 2 and len(self.sequence_attentions) >= 1 and len(self.mlp) >= 3
+            self.layer_steps = [
+                                partial(
+                                    self.call_features_attention,
+                                    index=0
+                                ),
+                                self.mlp[0],
+                                partial(
+                                    self.call_features_attention,
+                                    index=1
+                                ),
+                                self.mlp[1],
+                                partial(
+                                    self.call_sequence_attention,
+                                    index=0
+                                ),
+                                self.mlp[2]
+            ]
+        elif self.layer_arch == 'smf':
+            assert len(self.feature_attentions) >= 1 and len(self.sequence_attentions) >= 1 and len(self.mlp) >= 1
+            self.layer_steps = [
+                                partial(
+                                    self.call_sequence_attention,
+                                    index=0
+                                ),
+                                self.mlp[0],
+                                partial(
+                                    self.call_features_attention,
+                                    index=0
+                                )
+            ]
+        else:
+            raise ValueError(f"Unsupport layr arch: {self.layer_arch}")
     
         self.layer_norms = nn.ModuleList(
             [
@@ -400,47 +552,81 @@ class EncoderBaseLayer(nn.Module):
                                 index: int = 0,calculate_sample_attention:bool=False):
         assert len(self.sequence_attentions) > index
         sample_attention=None
+        index1 = index*2 if self.seq_attn_isolated else index
+        index2 = index1+1 if self.seq_attn_isolated else index1
+        assert index2 < len(self.sequence_attentions), f"Error: index2({index2}) >= len(self.sequence_attentions)({len(self.sequence_attentions)})"
+
+        x_train = self.sequence_attentions[index1](
+                        x = x[:, :eval_pos].transpose(1, 2),
+                        x_kv = x[:, :eval_pos].transpose(1, 2),
+                        copy_first_head_kv = True if self.self_share_all_kv_heads else False,
+                    )[0].transpose(1, 2)
+
+        if self.seq_attn_serial:
+            x[:, :eval_pos] = x_train
+
         if eval_pos < x.shape[1]:
-            x_test,_,sample_attention = self.sequence_attentions[index](
+            x_test,_,sample_attention = self.sequence_attentions[index2](
                                                     x=x[:, eval_pos:].transpose(1, 2),
                                                     x_kv=x[:, :eval_pos].transpose(1, 2),
-                                                    copy_first_head_kv=True,
+                                                    copy_first_head_kv=True if self.cross_share_all_kv_heads else False,
                                                     calculate_sample_attention=calculate_sample_attention
                                                 )
             x_test=x_test.transpose(1, 2)
         else:
             x_test = None
-            print(f"Warning: eval_pos >= x.shape[1]!")
-        x_train = self.sequence_attentions[index](
-                        x = x[:, :eval_pos].transpose(1, 2),
-                        x_kv = x[:, :eval_pos].transpose(1, 2)
-                    )[0].transpose(1, 2)
+            print(f"\033[30;43mWarning: eval_pos >= x.shape[1]!\033[0m")
         
         if x_test is not None:
             return torch.cat([x_train, x_test], dim=1),None,sample_attention
         else:
             return x_train
 
-    def forward(self, x: torch.Tensor, feature_atten_mask: torch.Tensor, eval_pos: int,layer_idx:int) -> tuple[torch.Tensor,torch.Tensor | None,torch.Tensor | None]:
+    def forward(self, x: torch.Tensor, feature_atten_mask: torch.Tensor, eval_pos: int,**kwargs) -> tuple[torch.Tensor,torch.Tensor | None,torch.Tensor | None]:
+        calculate_sample_attention = kwargs.get("calculate_sample_attention", False)
+        calculate_feature_attention = kwargs.get("calculate_feature_attention", False)
+        layer_idx = kwargs.get("layer_idx", 11)
+
         feature_attenion=None
         sample_attention=None
         for idx, (sublayer, layer_norm) in enumerate(zip(self.layer_steps, self.layer_norms)):
-            residual = x
-            x = layer_norm(x)
-            if idx == 2 and self.calculate_feature_attention and layer_idx == 11:
-                x, feature_attenion, _ = sublayer(x, feature_atten_mask, eval_pos,calculate_feature_attention=True)
-            elif idx == 4 and self.calculate_sample_attention and layer_idx == 11:
-                x, _, sample_attention = sublayer(x, feature_atten_mask, eval_pos,calculate_sample_attention=True)
-            else:
-                if isinstance(sublayer, functools.partial):
-                    x = sublayer(x, feature_atten_mask, eval_pos)
-                    if isinstance(x, tuple):
-                        x = x[0]
+            if self.pre_norm:
+                residual = x
+                x = layer_norm(x)
+                if idx == 2 and calculate_feature_attention and layer_idx == 11:
+                    x, feature_attenion, _ = sublayer(x, feature_atten_mask, eval_pos,calculate_feature_attention=True)
+                elif idx == 4 and calculate_sample_attention and layer_idx == 11:
+                    x, _, sample_attention = sublayer(x, feature_atten_mask, eval_pos,calculate_sample_attention=True)
                 else:
-                    x = sublayer(x)
-                    if isinstance(x, tuple):
-                        x = x[0]
+                    if isinstance(sublayer, functools.partial):
+                        x = sublayer(x, feature_atten_mask, eval_pos)
+                        if isinstance(x, tuple):
+                            x = x[0]
+                    else:
+                        x = sublayer(x)
+                        if isinstance(x, tuple):
+                            x = x[0]
                 x = x + residual
+            else:
+                residual = x
+                if idx == 2 and calculate_feature_attention and layer_idx == 11:
+                    x, feature_attenion, _ = sublayer(x, feature_atten_mask, eval_pos,calculate_feature_attention=True)
+                    x = x + residual
+                elif idx == 0 and calculate_sample_attention and layer_idx == 11:
+                    x, _, sample_attention = sublayer(x, feature_atten_mask, eval_pos, calculate_sample_attention=True)
+                    x = x + residual
+                else:
+                    if  isinstance(sublayer, functools.partial):
+                        x = sublayer(x, feature_atten_mask, eval_pos)
+                        if isinstance(x, tuple):
+                            x = x[0]
+                        x = x + residual
+                    else:
+                        x = sublayer(x)
+                        if isinstance(x, tuple):
+                            x = x[0]
+                        x = x + residual
+                x=layer_norm(x)
         return x,feature_attenion,sample_attention
                 
 class LayerStack(nn.Module):
@@ -451,7 +637,7 @@ class LayerStack(nn.Module):
     def __init__(self, layers: list[nn.Module]):
         super().__init__()
         self.layers = nn.ModuleList(layers)
-    
+
     def forward(self, x, **kwargs):
         for idx,layer in enumerate(self.layers):
             kwargs["layer_idx"] = idx

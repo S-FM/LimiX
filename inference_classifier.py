@@ -26,6 +26,12 @@ from utils.utils import  download_datset, download_model
 if not torch.cuda.is_available():
     raise SystemError('GPU device not found. For fast training, please enable GPU.')
 
+def get_rank():
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank()
+    else:
+        return 0
+
 def auc_metric(target, pred, multi_class='ovo', numpy=False):
     lib = np if numpy else torch
     try:
@@ -182,7 +188,7 @@ if __name__ == '__main__':
     for idx, folder in tqdm(enumerate(os.listdir(data_root))):
         X_train, X_test, y_train, y_test = None, None, None, None
         folder_path = os.path.join(data_root, folder)
-        
+
         if os.path.isfile(folder_path):
             continue
         try:
@@ -220,10 +226,17 @@ if __name__ == '__main__':
                         classifier.set_inference_config(inference_config, 0.9, 0)
 
                 try:
+                    t1 = time.time()
+                    t2 = t1
                     rst, prediction_,testy = inference_dataset(classifier, le, scaler, X_train.copy(), y_train.copy(), X_test.copy(), y_test.copy())
+                    t2 = time.time()
                     assert rst is not None, f'Error processing {folder} with sample_index {sample_index}: rst is None. seq_len({len(X_train)}) is greater than 50,000, skip due to GPU memory limitations'
                 except Exception as e:
-                    print(f"Error processing {folder} with sample_index {sample_index}: {e}")
+                    if args.debug:
+                        raise
+                    else:
+                        msg = str(e)
+                        print(f"Error processing {folder} with sample_index {sample_index}: {msg[:200]}")
                     sample_index += 1
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
@@ -235,10 +248,11 @@ if __name__ == '__main__':
                 if sample_index == 0:
                     aucs['default_auc'] = rst['auc']
                 aucs['sample_auc'].append(rst['auc'])
+                rst['time'] = (t2-t1)*1000
 
                 sample_index += 1
 
-                if not(int(os.environ.get('WORLD_SIZE', -1)) > 0 and dist.get_rank() != 0):
+                if not(int(os.environ.get('WORLD_SIZE', -1)) > 0 and get_rank() != 0):
                     output_df = {'label':testy}
                     for i in range(class_num):
                         output_df[f'pred_{i}'] = prediction_[:,i]
@@ -254,7 +268,11 @@ if __name__ == '__main__':
                 print(f"[{idx}] {folder} -> default_auc: {aucs['default_auc']:.6f}, sample_auc: max: {np.max(aucs_list):.6f}, mean: {np.mean(aucs_list):.6f},  min: {np.min(aucs_list):.6f}")
 
         except Exception as e:
-            print(f"Error processing: {e}")
+            if args.debug:
+                raise
+            else:
+                msg = str(e)
+                print(f"Error processing {folder}: {msg[:200]}")
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -262,7 +280,7 @@ if __name__ == '__main__':
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-    if not(int(os.environ.get('WORLD_SIZE', -1))>0 and dist.get_rank() != 0):
+    if not(int(os.environ.get('WORLD_SIZE', -1))>0 and get_rank() != 0):
         rstsdf = pd.DataFrame(rsts)
         rstsdf.to_csv(os.path.join(save_root, 'all_rst.csv'), index=False)
 

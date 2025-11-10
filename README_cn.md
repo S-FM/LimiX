@@ -4,6 +4,7 @@
 
 # 最新进展 :boom: 
  - 2025-08-29: LimiX V1.0 发布
+ - 2025-11-10: LimiX-2M 正式发布！与 LimiX-16M 相比，此版本在显著降低 GPU 内存占用的同时，实现了更快的推理速度。在此基础上，LimiX 的样本检索机制也得到了优化，模型的性能进一步提升，并有效减少了该模式下的推理时间与显存消耗
 
 # ➤ 简介
 <div align="center">
@@ -58,6 +59,7 @@ LimiX支持分类、回归、缺失值插补等任务。
 | 模型尺寸 | 下载链接 | 支持的任务 |
 | --- | --- | --- |
 |  LimiX-16M | [LimiX-16M.ckpt](https://huggingface.co/stableai-org/LimiX-16M/tree/main) |  ✅ 分类  ✅回归   ✅缺失值插补 |
+|  LimiX-2M | [LimiX-2M.ckpt](https://huggingface.co/stableai-org/LimiX-2M/tree/main) |  ✅ 分类  ✅回归   ✅缺失值插补 |
 
 
 ## ➩ 接口说明
@@ -114,12 +116,12 @@ def predict(self, x_train:np.ndarray, y_train:np.ndarray, x_test:np.ndarray) -> 
 考虑到推理速度、显存占用，基于样本检索的ensemble推理目前只支持基于版本高于NVIDIA-RTX 4090显卡的硬件条件。
 ### 分类任务
 ```
-torchrun --nproc_per_node=8 inference_classifier.py --save_name your_save_name --inference_config_path path_to_config --data_dir path_to_data
+python inference_classifier.py --save_name your_save_name --inference_config_path path_to_retrieval_config --data_dir path_to_data
 ```
 
 ### 回归任务
 ```
-torchrun --nproc_per_node=8 inference_regression.py --save_name your_save_name --inference_config_path path_to_config --data_dir path_to_data
+python inference_regression.py --save_name your_save_name --inference_config_path path_to_retrieval_config --data_dir path_to_data
 ```
 
 ### 个性化设置推理任务的数据预处理方式
@@ -131,21 +133,39 @@ generate_infenerce_config()
 ### 分类任务
 #### 单卡或者CPU
 ```
-python  inference_classifier.py --save_name your_save_name --inference_config_path path_to_config --data_dir path_to_data
+python  inference_classifier.py --save_name your_save_name --inference_config_path path_to_retrieval_config --data_dir path_to_data
 ```
 #### 多卡分布式推理
 ```
-torchrun --nproc_per_node=8  inference_classifier.py --save_name your_save_name --inference_config_path path_to_config --data_dir path_to_data --inference_with_DDP
+torchrun --nproc_per_node=8  inference_classifier.py --save_name your_save_name --inference_config_path path_to_retrieval_config --data_dir path_to_data --inference_with_DDP
 ```
 
 ### 回归任务
 #### 单卡或者CPU
 ```
-python  inference_regression.py --save_name your_save_name --inference_config_path path_to_config --data_dir path_to_data
+python  inference_regression.py --save_name your_save_name --inference_config_path path_to_retrieval_config --data_dir path_to_data
 ```
 #### 多卡分布式推理
 ```
-torchrun --nproc_per_node=8  inference_regression.py --save_name your_save_name --inference_config_path path_to_config --data_dir path_to_data --inference_with_DDP
+torchrun --nproc_per_node=8  inference_regression.py --save_name your_save_name --inference_config_path path_to_retrieval_config --data_dir path_to_data --inference_with_DDP
+```
+
+### 样本检索的超参检索
+本项目提供了一个样本检测的超参搜索套件。为了获得最佳性能，我们使用 Optuna 对检索参数进行超参数优化
+#### 安装
+```
+pip install optuna
+```
+#### 使用方法
+若要使用超参数优化进行标准推理，请参考如下代码，这段代码将启动一个 Optuna 搜索，用于为特定数据集和应用场景寻找最佳的检索参数组合：
+```
+searchInference = RetrievalSearchHyperparameters(
+           dict(device_id=0, model_path=model_path), X_train, y_train, X_test, y_test,
+)
+config, result = searchInference.search(
+              n_trials=10, metric="AUC",
+              inference_config='config/cls_default_retrieval.json',
+              task_type="cls")
 ```
 
 ## ➩ 分类

@@ -4,6 +4,7 @@
 
 # News :boom: 
  - 2025-08-29: LimiX V1.0 Released.
+ - 2025-11-10: LimiX-2M is officially released! Compared to LimiX-16M, this smaller variant offers significantly lower GPU memory usage and faster inference speed. The retrieval mechanism has also been enhanced, further improving model performance while reducing both inference time and memory consumption.
 
 # ➤ Overview
 <div align="center">
@@ -65,6 +66,7 @@ LimiX supports tasks such as classification, regression, and missing value imput
 | Model size | Download link | Tasks supported |
 | --- | --- | --- |
 | LimiX-16M | [LimiX-16M.ckpt](https://huggingface.co/stableai-org/LimiX-16M/tree/main) |  ✅ classification  ✅regression   ✅missing value imputation |
+| LimiX-2M | [LimiX-2M.ckpt](https://huggingface.co/stableai-org/LimiX-2M/tree/main) |  ✅ classification  ✅regression   ✅missing value imputation |
 
 ## ➩ Interface description
 
@@ -125,13 +127,13 @@ Considering inference speed and memory requirements, ensemble inference based on
 ### Classification Task
 
 ```
-torchrun --nproc_per_node=8 inference_classifier.py --save_name your_save_name --inference_config_path path_to_config --data_dir path_to_data
+python inference_classifier.py --save_name your_save_name --inference_config_path path_to_retrieval_config --data_dir path_to_data
 ```
 
 ### Regression Task
 
 ```
-torchrun --nproc_per_node=8 inference_regression.py --save_name your_save_name --inference_config_path path_to_config --data_dir path_to_data
+python inference_regression.py --save_name your_save_name --inference_config_path path_to_retrieval_config --data_dir path_to_data
 ```
 
 ### Customizing Data Preprocessing for Inference Tasks
@@ -145,27 +147,45 @@ generate_inference_config()
 #### Single GPU or CPU
 
 ```
-python  inference_classifier.py --save_name your_save_name --inference_config_path path_to_config --data_dir path_to_data
+python  inference_classifier.py --save_name your_save_name --inference_config_path path_to_retrieval_config --data_dir path_to_data
 ```
 
 #### Multi-GPU Distributed Inference
 
 ```
-torchrun --nproc_per_node=8  inference_classifier.py --save_name your_save_name --inference_config_path path_to_config --data_dir path_to_data --inference_with_DDP
+torchrun --nproc_per_node=8  inference_classifier.py --save_name your_save_name --inference_config_path path_to_retrieval_config --data_dir path_to_data --inference_with_DDP
 ```
 
 ### Regression Task
 #### Single GPU or CPU
 
 ```
-python  inference_regression.py --save_name your_save_name --inference_config_path path_to_config --data_dir path_to_data
+python  inference_regression.py --save_name your_save_name --inference_config_path path_to_retrieval_config --data_dir path_to_data
 ```
 
 #### Multi-GPU Distributed Inference
 
 ```
-torchrun --nproc_per_node=8  inference_regression.py --save_name your_save_name --inference_config_path path_to_config --data_dir path_to_data --inference_with_DDP
+torchrun --nproc_per_node=8  inference_regression.py --save_name your_save_name --inference_config_path path_to_retrieval_config --data_dir path_to_data --inference_with_DDP
 ```
+
+### Retrieval Optimization Project
+This project implements an optimized retrieval system. To achieve the best performance, we utilize Optuna for hyperparameter tuning of retrieval parameters.
+#### Installation
+Ensure you have the required dependencies installed:
+```
+pip install optuna
+```
+#### Usage
+For standard inference using pre-optimized parameters, refer to the code below:
+```
+searchInference = RetrievalSearchHyperparameters(
+           dict(device_id=0,model_path=model_path), X_train, y_train, X_test, y_test,
+)
+config, result = searchInference.search(n_trials=10, metric="AUC",
+              inference_config='config/cls_default_retrieval.json',task_type="cls")
+```
+This will launch an Optuna study to find the best combination of retrieval parameters for your specific dataset and use case.
 
 ## ➩ Classification
 ```python

@@ -21,6 +21,7 @@ from sklearn.impute import SimpleImputer
 from sklearn.decomposition import TruncatedSVD
 from sklearn.utils.validation import check_is_fitted
 from utils.data_utils import TabularInferenceDataset
+from torch.cuda import OutOfMemoryError
 
 import hashlib
 from kditransform import KDITransformer
@@ -250,39 +251,6 @@ class CategoricalFeatureEncoder(BasePreprocess):
         self.transformer = None
         self.category_mappings = None
         self.categorical_features = None
-
-    # @override
-    # def fit(self, x:np.ndarray, categorical_features:list[int], seed:int, **kwargs) -> list[int]:
-    #     self.random_seed = seed
-    #     self.transformer, self.categorical_features = self._create_transformer(x, categorical_features)
-        
-    #     if self.transformer is not None:
-    #         self.transformer.fit(x)
-            
-    #         if self.encoding_strategy == "ordinal_shuffled":
-    #             _, rng = infer_random_state(self.random_seed)
-    #             categories = self.transformer.named_transformers_["ordinal_encoder"].categories_
-    #             self.category_mappings = {
-    #                 idx: rng.permutation(len(cat)) 
-    #                 for idx, cat in enumerate(categories)
-    #             }
-        
-    #     return self.categorical_features
-
-    # @override
-    # def transform(self, x:np.ndarray, **kwargs) -> tuple[np.ndarray, list[int]]:
-    #     if self.transformer is None:
-    #         return x, self.categorical_features or []
-    #     # todo 不生效？
-    #     transformed = self.transformer.transform(x)
-        
-    #     if self.category_mappings is not None:
-    #         for col_idx, mapping in self.category_mappings.items():
-    #             col_data = transformed[:, col_idx]
-    #             valid_mask = ~np.isnan(col_data)
-    #             col_data[valid_mask] = mapping[col_data[valid_mask].astype(int)]
-                
-    #     return transformed, self.categorical_features
 
     @override
     def fit_transform(self, x:np.ndarray, categorical_features:list[int], seed:int, **kwargs) -> tuple[np.ndarray, list[int]]:
@@ -719,11 +687,18 @@ class SubSampleData():
         if self.subsample_type == "sample":
             if self.use_type == "mixed":
                 y_feature_attention_score = feature_attention_score[:, -1, :].squeeze().permute(1, 0).unsqueeze(
-                    2).repeat(1, 1,
-                              sample_attention_score.shape[2])  # shape [features,test_sample_lens,train_sample_lens]
+                    -1) # shape [features,test_sample_lens,1] broadcast to [features,test_sample_lens,train_sample_lens]
+                #TODO jianshengli may cause OOM
+                try:
+                    self.attention_score = torch.mean(sample_attention_score.to("cuda") * y_feature_attention_score.to("cuda"),
+                                                      dim=0).cpu()  # shape [test_sample_lens,train_sample_lens]
+                except OutOfMemoryError as e:
+                    print("calculate attention score OOM, use cpu")
+                    self.attention_score = torch.mean(
+                        sample_attention_score.cpu() * y_feature_attention_score.cpu(),
+                        dim=0)
+                del sample_attention_score,y_feature_attention_score
 
-                self.attention_score = torch.mean(sample_attention_score * y_feature_attention_score,
-                                                  dim=0)  # shape [test_sample_lens,train_sample_lens]
             else:
                 self.attention_score = sample_attention_score[-1, :, :]
             self.X_train = x
@@ -731,7 +706,7 @@ class SubSampleData():
         else:
             y_feature_attention_score = torch.mean(feature_attention_score[:, -1, :].squeeze(),dim=0)  # shape [test_sample_lens,features]
             if subsample_idx is None:
-                self.subsample_idx = np.argsort(y_feature_attention_score)[-min(self.subsample_num, x.shape[0]):]
+                self.subsample_idx = torch.argsort(y_feature_attention_score)[-min(self.subsample_num, x.shape[0]):]
             else:
                 self.subsample_idx = subsample_idx
             self.X_train = x

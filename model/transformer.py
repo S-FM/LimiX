@@ -3,8 +3,7 @@ import torch.nn as nn
 from model.layer import EncoderBaseLayer, MLP, LayerStack
 from typing import Any, Literal
 from model.encoders import get_x_encoder, get_cls_y_encoder, get_reg_y_encoder, preprocesss_4_x
-
-
+from torch.amp import autocast
 
 
 class FeaturesTransformer(nn.Module):
@@ -19,16 +18,19 @@ class FeaturesTransformer(nn.Module):
                 nhead: int, 
                 embed_dim: int, 
                 hid_dim:int,
+                feature_positional_embedding_type:Literal['none','subortho'] = 'subortho',
                 mask_prediction: bool = False,
                 features_per_group:int = 2,
                 dropout: float=0,
+                pre_norm: bool=False,
                 activation: str='gelu',
                 layer_norm_eps: float=1e-5,
                 device: torch.device|None=None,
                 dtype: torch.dtype|None=None,
                 recompute_attn: bool=False,
-                calculate_sample_attention: bool = False,
-                calculate_feature_attention: bool = False
+                mlp_use_residual:bool=False,
+                layer_arch: str = 'fmfmsm',
+                **layer_kwargs:Any
                 ):
         super().__init__()
         
@@ -36,6 +38,7 @@ class FeaturesTransformer(nn.Module):
         self.encoder_config_x = encoder_config_x
         self.encoder_config_y = encoder_config_y
         self.decoder_config = decoder_config
+        self.feature_positional_embedding_type = feature_positional_embedding_type
         self.nlayers = nlayers
         self.nhead = nhead
         self.embed_dim = embed_dim
@@ -43,24 +46,29 @@ class FeaturesTransformer(nn.Module):
         self.mask_prediction = mask_prediction
         self.features_per_group = features_per_group
         self.dropout = dropout
+        self.pre_norm = pre_norm
         self.activation = activation
         self.layer_norm_eps = layer_norm_eps
         self.device = device
         self.dtype = dtype
         self.recompute_attn = recompute_attn
+        self.mlp_use_residual = mlp_use_residual
+        self.layer_arch = layer_arch
 
         layer_creator = lambda: EncoderBaseLayer(
             embed_dim=self.embed_dim,
             hid_dim=self.hid_dim,
             nhead=self.nhead,
             dropout=self.dropout,
+            pre_norm=self.pre_norm,
             activation=self.activation, # type: ignore
             layer_norm_eps=self.layer_norm_eps,
             device=self.device,
             dtype=self.dtype,
             recompute_attn=self.recompute_attn,
-            calculate_sample_attention=calculate_sample_attention,
-            calculate_feature_attention=calculate_feature_attention
+            mlp_use_residual=self.mlp_use_residual,
+            layer_arch=self.layer_arch, # type: ignore
+            **layer_kwargs
         )
 
         self.encoder_x = get_x_encoder( **encoder_config_x)
@@ -68,7 +76,7 @@ class FeaturesTransformer(nn.Module):
         self.reg_y_encoder = get_reg_y_encoder(**encoder_config_y)
 
         self.transformer_encoder = LayerStack([layer_creator() for _ in range(self.nlayers)])
-        self.encoder_out_norm = nn.LayerNorm(self.embed_dim, eps=1e-5, elementwise_affine=False)
+        self.encoder_out_norm = nn.LayerNorm(self.embed_dim, eps=1e-5, elementwise_affine=False) if pre_norm else nn.Identity()
 
         self.cls_y_decoder = nn.Sequential(
                                             nn.Linear(self.embed_dim, self.hid_dim),
@@ -89,16 +97,25 @@ class FeaturesTransformer(nn.Module):
                                         nn.Linear(self.hid_dim, self.features_per_group),
                                         )
         
-        self.feature_positional_embedding = nn.Linear(self.embed_dim // 4, self.embed_dim)
+        if feature_positional_embedding_type == "learned":
+            self.feature_positional_embedding = nn.Embedding(1_000, self.embed_dim)
+        elif feature_positional_embedding_type == "subspace":
+            self.feature_positional_embedding = nn.Linear(self.embed_dim // 4, self.embed_dim)
+        elif feature_positional_embedding_type == "subortho":
+            self.feature_positional_embedding = nn.Linear(self.embed_dim // 4, self.embed_dim)
         
         self.x_preprocess = preprocesss_4_x(**preprocess_config_x)
-        self.calculate_sample_attention = calculate_sample_attention
-        self.calculate_feature_attention = calculate_feature_attention
+
 
     def forward(self, x: torch.Tensor, 
                 y: torch.Tensor, 
                 eval_pos: int, 
-                task_type: Literal['reg', 'cls'] = 'cls') -> torch.Tensor | dict[str, torch.Tensor] | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+                y_type: torch.Tensor = None,
+                task_type: Literal['reg', 'cls'] = 'cls',
+                calculate_sample_attention: bool = False,
+                calculate_feature_attention: bool = False,
+                **kwargs
+                ) -> torch.Tensor | dict[str, torch.Tensor] | tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         '''
             x: The input x, which includes both train x and test x, Shape: [batch, sequence, feature]
             y: The input y, which includes both train y and test y, Shape: [batch, label]
@@ -159,7 +176,7 @@ class FeaturesTransformer(nn.Module):
                     dim=1
                 )
         # Mask the test y
-        y["data"][eval_pos:] = torch.nan
+        y["data"][:, eval_pos:] = torch.nan
         
         if task_type == 'cls':
             y_type =  torch.zeros_like(y['data'], device=y['data'].device)
@@ -175,11 +192,13 @@ class FeaturesTransformer(nn.Module):
         embedded_all = torch.cat((embedded_x, embedded_y.unsqueeze(2)), dim=2)
         if torch.isnan(embedded_all).any():
             raise ValueError("embedded_all contains NaN values; please add a NanEncoder in the encoder")
-        if self.calculate_sample_attention or self.calculate_feature_attention:
-            return self.transformer_encoder(embedded_all, feature_atten_mask=None, eval_pos=eval_pos)
+        if calculate_sample_attention or calculate_feature_attention:
+            return self.transformer_encoder(embedded_all, feature_atten_mask=None, eval_pos=eval_pos,
+                                            calculate_sample_attention=calculate_sample_attention,
+                                            calculate_feature_attention=calculate_feature_attention, **kwargs)
         else:
             pass
-        encoder_out = self.transformer_encoder(embedded_all, feature_atten_mask=None, eval_pos=eval_pos)[0]
+        encoder_out = self.transformer_encoder(embedded_all, feature_atten_mask=None, eval_pos=eval_pos, **kwargs)[0]
         encoder_out = self.encoder_out_norm(encoder_out)
         
         test_encoder_out = encoder_out[:, eval_pos:, -1]
@@ -212,7 +231,7 @@ class FeaturesTransformer(nn.Module):
     
     def mixed_y_embedding(self, y:dict, y_type:torch.Tensor, eval_pos:int):
         y = y['data']
-        seq_len, batch_size, y_num = y.shape
+        batch_size, seq_len, y_num = y.shape
         y_flat = y.reshape(-1)
         y_type_flat = y_type.reshape(-1)
         
@@ -222,8 +241,8 @@ class FeaturesTransformer(nn.Module):
         y_cls = y_flat[idx_cls]
         y_reg = y_flat[idx_reg]
 
-        y_cls = y_cls.reshape(seq_len, -1, y_num)
-        y_reg = y_reg.reshape(seq_len, -1, y_num)
+        y_cls = y_cls.reshape(-1, seq_len, y_num)
+        y_reg = y_reg.reshape(-1, seq_len, y_num)
         y_cls = {'data': y_cls, 'eval_pos':eval_pos}
         y_reg = {'data': y_reg, 'eval_pos':eval_pos}
 
@@ -242,7 +261,7 @@ class FeaturesTransformer(nn.Module):
             reg_y_emb_flat = reg_y_emb.reshape(-1, emb_size).to(torch.float16)
             out.index_put_((idx_reg,), reg_y_emb_flat)
 
-        output = out.reshape(seq_len, batch_size, emb_size)
+        output = out.reshape(batch_size, seq_len, emb_size)
         return output
     
     def process_4_x(self, data:dict):
@@ -253,19 +272,24 @@ class FeaturesTransformer(nn.Module):
         return data
     
     def add_embeddings(self, x:torch.Tensor):
-        with torch.amp.autocast('cuda', enabled=False):
-            embs = torch.randn(
-                (x.shape[2], x.shape[3] // 4),
-                device=x.device,
-                dtype=torch.float32,
-            )
-            torch.nn.init.orthogonal_(embs)
-        embs =self.feature_positional_embedding(embs.to(x.dtype))
-        x += embs[None, None]
+        if self.feature_positional_embedding_type == "subortho":
+            with autocast(device_type=x.device.type, enabled=False):
+                embs = torch.randn(
+                    (x.shape[2], x.shape[3] // 4),
+                    device=x.device,
+                    dtype=torch.float32,
+                )
+                torch.nn.init.orthogonal_(embs)
+            embs =self.feature_positional_embedding(embs.to(x.dtype))
+            x += embs[None, None]
+        elif self.feature_positional_embedding_type is None or self.feature_positional_embedding_type == "none":
+            embs = None
+        else:
+            raise ValueError(f"Unknown feature_positional_embedding_type={self.feature_positional_embedding_type}")
         return x
     
     def y_decoder(self, test_encoder_out, test_y_type):
-        seq_len, _, emb_size = test_encoder_out.shape
+        _, seq_len, emb_size = test_encoder_out.shape
         flat_test_encoder_out = test_encoder_out.reshape(-1, emb_size)
         flat_test_y_type = test_y_type.reshape(-1)
         
@@ -275,8 +299,8 @@ class FeaturesTransformer(nn.Module):
 
         cls_y_encoder_out = flat_test_encoder_out[idx_cls]
         reg_y_encoder_out = flat_test_encoder_out[idx_reg]
-        cls_y_encoder_out = cls_y_encoder_out.reshape(seq_len, -1, emb_size)
-        reg_y_encoder_out = reg_y_encoder_out.reshape(seq_len, -1, emb_size)
+        cls_y_encoder_out = cls_y_encoder_out.reshape(-1, seq_len, emb_size)
+        reg_y_encoder_out = reg_y_encoder_out.reshape(-1, seq_len, emb_size)
 
         cls_y = self.cls_y_decoder(cls_y_encoder_out)
         reg_y = self.reg_y_decoder(reg_y_encoder_out)

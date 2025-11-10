@@ -231,7 +231,7 @@ class LimiXPredictor:
                                         handle_unknown="use_encoded_value",
                                         unknown_value=-1,
                                         encoded_missing_value=np.nan)
-        col_encoder = ColumnTransformer(transformers=[("encoder", ordinal_encoder, make_column_selector(dtype_include=["category", "string"]))],
+        col_encoder = ColumnTransformer(transformers=[("encoder", ordinal_encoder, make_column_selector(dtype_include=["category", "string", "bool"]))],
                                         remainder=FunctionTransformer(),
                                         sparse_threshold=0.0,
                                         verbose_feature_names_out=False,
@@ -309,6 +309,7 @@ class LimiXPredictor:
         # Preprocess x
         x = self.convert_x_dtypes(x)
         x = self.convert_category2num(x)
+        x = x.astype(np.float32)
         categorical_idx = self.get_categorical_features_indices(x)
         outputs = []
         mask_predictions = []
@@ -318,16 +319,16 @@ class LimiXPredictor:
             categorical_idx_ = categorical_idx.copy()
             for id_step, step in enumerate(pipe):
                 if isinstance(step, InferenceAttentionMap):
-                    feature_attention_score, sample_attention_score = step.inference(X_train=x_[:len(y_train)],
-                                                                                     y_train=y_train,
-                                                                                     X_test=x_[len(y_train):],
-                                                                                     task_type="cls")
+                    feature_attention_score, sample_attention_score = step.inference(X_train=x_[:len(y_train)].astype(np.float32),
+                                                                                     y_train=y_train.astype(np.float32),
+                                                                                     X_test=x_[len(y_train):].astype(np.float32),
+                                                                                     task_type="cls",device=self.device)
                    
                 elif isinstance(step, SubSampleData):
                     step.fit(torch.from_numpy(x_[:len(y_train)]), torch.from_numpy(y_train),
                              feature_attention_score=feature_attention_score,
                              sample_attention_score=sample_attention_score,
-                             subsample_ratio=self.inference_config[id_pipe]["retrieval_config"]["subsample_ratio"])
+                             subsample_ratio=self.inference_config[id_pipe]["retrieval_config"].get("sub_feature_ratio", 0.5))
                     if self.inference_config[id_pipe]["retrieval_config"]["subsample_type"] == "feature":
                         x_ = step.transform(torch.from_numpy(x_[len(y_train):]).float())
                         categorical_idx_ = self.get_categorical_features_indices(x_)
@@ -345,15 +346,24 @@ class LimiXPredictor:
                     self.inference_config[id_pipe]["retrieval_config"]["subsample_type"] == "sample":
                 inference = InferenceResultWithRetrieval(model=self.model,
                                                          sample_selection_type="AM")
-                output = inference.inference(x_[:len(y_train)].squeeze(), y_.squeeze(),
-                                             x_[len(y_train):].squeeze(),
+                output = inference.inference(x_[:len(y_train)], y_,
+                                             x_[len(y_train):],
                                              attention_score=attention_score,
                                              retrieval_len=self.inference_config[id_pipe]["retrieval_config"][
-                                                 "subsample_ratio"],
-                                             dynamic_ratio=self.inference_config[id_pipe]["retrieval_config"][
-                                                 "dynamic_ratio"] if "dynamic_ratio" in self.inference_config[id_pipe][
-                                                 "retrieval_config"] else None,
-                                             task_type="cls")
+                                                 "retrieval_len"],
+                                             dynamic_ratio=self.inference_config[id_pipe]["retrieval_config"].get(
+                                                 "dynamic_ratio", None),
+                                             use_cluster=self.inference_config[id_pipe]["retrieval_config"].get(
+                                                 "use_cluster", False),
+                                             cluster_num=self.inference_config[id_pipe]["retrieval_config"].get(
+                                                 "cluster_num", 20),
+                                             task_type="cls",
+                                             use_threshold=self.inference_config[id_pipe]["retrieval_config"].get(
+                                                 "use_threshold", False),
+                                             threshold=self.inference_config[id_pipe]["retrieval_config"].get(
+                                                 "threshold", 1),
+                                             mixed_method=self.inference_config[id_pipe]["retrieval_config"].get(
+                                                 "mixed_method", "max"),device=self.device)
                 if self.softmax_temperature != 1:
                     output = (output[:, :self.n_classes].float() / self.softmax_temperature)
 
@@ -371,7 +381,7 @@ class LimiXPredictor:
                 outputs.append(output)
             else:
                 self.model.to(self.device)
-                with(torch.autocast(device_type='cuda', enabled=self.mix_precision), torch.inference_mode()):
+                with(torch.autocast(device_type=self.device.type if isinstance(self.device, torch.device) else self.device, enabled=self.mix_precision), torch.inference_mode()):
                     x_=x_.unsqueeze(0)
                     y_ = y_.unsqueeze(0)
                     output=self.model(x=x_, y=y_, eval_pos=y_.shape[1], task_type='cls')
@@ -500,7 +510,8 @@ class LimiXPredictor:
         # preprocess x
         x = self.convert_x_dtypes(x)
         x = self.convert_category2num(x)
-        x = x.astype(float)
+        # x = x.astype(np.float32)
+        # y_train = y_train.astype(np.float32)
         categorical_idx = self.get_categorical_features_indices(x)
     
         outputs = []
@@ -512,16 +523,16 @@ class LimiXPredictor:
             for id_step, step in enumerate(pipe):
                 if isinstance(step, InferenceAttentionMap):
 
-                    feature_attention_score, sample_attention_score = step.inference(X_train=x_[:len(y_train)],
-                                                                                     y_train=y_train,
-                                                                                     X_test=x_[len(y_train):],
-                                                                                     task_type="reg")
+                    feature_attention_score, sample_attention_score = step.inference(X_train=x_[:len(y_train)].astype(np.float32),
+                                                                                     y_train=y_.astype(np.float32),
+                                                                                     X_test=x_[len(y_train):].astype(np.float32),
+                                                                                     task_type="reg",device=self.device)
                     
                 elif isinstance(step, SubSampleData):
                     step.fit(torch.from_numpy(x_[:len(y_train)]), torch.from_numpy(y_train),
                              feature_attention_score=feature_attention_score,
                              sample_attention_score=sample_attention_score,
-                             subsample_ratio=self.inference_config[id_pipe]["retrieval_config"]["subsample_ratio"])
+                             subsample_ratio=self.inference_config[id_pipe]["retrieval_config"].get("sub_feature_ratio", 0.5))
                     if self.inference_config[id_pipe]["retrieval_config"]["subsample_type"] == "feature":
                         x_ = step.transform(torch.from_numpy(x_[len(y_train):]).float())
                         categorical_idx_ = self.get_categorical_features_indices(x_)
@@ -538,11 +549,24 @@ class LimiXPredictor:
                     self.inference_config[id_pipe]["retrieval_config"]["subsample_type"] == "sample":
                 inference = InferenceResultWithRetrieval(model=self.model,
                                                          sample_selection_type="AM")
-                output = inference.inference(x_[:len(y_train)].squeeze(), y_.squeeze(),
-                                             x_[len(y_train):].squeeze(),
+                output = inference.inference(x_[:len(y_train)], y_,
+                                             x_[len(y_train):],
                                              attention_score=attention_score,
                                              retrieval_len=self.inference_config[id_pipe]["retrieval_config"][
-                                                 "subsample_ratio"], task_type="reg")
+                                                 "retrieval_len"],
+                                             dynamic_ratio=self.inference_config[id_pipe]["retrieval_config"].get(
+                                                 "dynamic_ratio", None),
+                                             use_cluster=self.inference_config[id_pipe]["retrieval_config"].get(
+                                                 "use_cluster", False),
+                                             cluster_num=self.inference_config[id_pipe]["retrieval_config"].get(
+                                                 "cluster_num", 20),
+                                             task_type="reg",
+                                             use_threshold=self.inference_config[id_pipe]["retrieval_config"].get(
+                                                 "use_threshold", False),
+                                             threshold=self.inference_config[id_pipe]["retrieval_config"].get(
+                                                 "threshold", 1),
+                                             mixed_method=self.inference_config[id_pipe]["retrieval_config"].get(
+                                                 "mixed_method", "max"),device=self.device)
                 outputs.append(output)
             elif self.inference_with_DDP:
                 inference = InferenceResultWithRetrieval(model=self.model,
@@ -552,7 +576,7 @@ class LimiXPredictor:
                 outputs.append(output)
             else:
                 self.model.to(self.device)
-                with(torch.autocast(device_type='cuda', enabled=self.mix_precision), torch.inference_mode()):
+                with(torch.autocast(device_type=self.device.type if isinstance(self.device, torch.device) else self.device, enabled=self.mix_precision), torch.inference_mode()):
                     x_=x_.unsqueeze(0)
                     y_ = y_.unsqueeze(0)
 
